@@ -1,0 +1,245 @@
+#! /usr/bin/python -E
+# Authors: Karl MacMillan <kmacmillan@mentalrootkit.com>
+#
+# Copyright (C) 2007  Red Hat
+# see file 'COPYING' for use and warranty information
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; version 2 only
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+import sys
+
+import getpass, ldap, re, krbV
+import traceback, logging
+
+from ipapython import ipautil
+from ipaserver.install import replication, dsinstance, installutils
+from ipaserver.plugins.ldap2 import ldap2
+from ipapython import version
+from ipalib import errors, util
+
+def parse_options():
+    from optparse import OptionParser
+
+    parser = OptionParser(version=version.VERSION)
+    parser.add_option("-H", "--host", dest="host", help="starting host")
+    parser.add_option("-p", "--password", dest="dirman_passwd", help="Directory Manager password")
+    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False,
+                      help="provide additional information")
+    parser.add_option("-f", "--force", dest="force", action="store_true", default=False,
+                      help="ignore some types of errors")
+    parser.add_option("--port", type="int", dest="port",
+                      help="port number of other server")
+    parser.add_option("--binddn", dest="binddn",
+                      help="Bind DN to use with remote server")
+    parser.add_option("--bindpw", dest="bindpw",
+                      help="Password for Bind DN to use with remote server")
+    parser.add_option("--winsync", dest="winsync", action="store_true", default=False,
+                      help="This is a Windows Sync Agreement")
+    parser.add_option("--cacert", dest="cacert",
+                      help="Full path and filename of CA certificate to use with TLS/SSL to the remote server")
+    parser.add_option("--win-subtree", dest="win_subtree",
+                      help="DN of Windows subtree containing the users you want to sync (default cn=Users,<domain suffix)")
+    parser.add_option("--passsync", dest="passsync",
+                      help="Password for the Windows PassSync user")
+
+    options, args = parser.parse_args()
+
+    if not len(args) or not ("list" in args[0] or "add" in args[0] or "del" in args[0] or "init" in args[0] or "synch" in args[0]):
+        parser.error("must provide a command [list | add | del | init | synch]")
+
+    # set log level
+    if options.verbose:
+        # if verbose, output events at INFO level if not already
+        mylogger = logging.getLogger()
+        if mylogger.getEffectiveLevel() > logging.INFO:
+            mylogger.setLevel(logging.INFO)
+        # else user has already configured logging externally lower
+    return options, args
+
+def get_realm_name():
+    c = krbV.default_context()
+    return c.default_realm
+
+def get_suffix():
+    l = ldap2(shared_instance=False, base_dn='')
+    suffix = l.normalize_dn(util.realm_to_suffix(get_realm_name()))
+    return suffix
+
+def get_host_name():
+    hostname = installutils.get_fqdn()
+    try:
+        installutils.verify_fqdn(hostname)
+    except RuntimeError, e:
+        logging.error(str(e))
+        sys.exit(1)
+
+    return hostname
+
+def list_masters(replman, verbose):
+    dns = replman.find_replication_dns(replman.conn)
+
+    for dn in dns:
+        entry = replman.conn.search_s(dn, ldap.SCOPE_SUBTREE)[0]
+        print entry.getValue('nsds5replicahost')
+
+        if verbose:
+            print "  last init status: %s" % entry.nsds5replicalastinitstatus
+            print "  last init ended: %s" % str(ipautil.parse_generalized_time(entry.nsds5replicalastinitend))
+            print "  last update status: %s" % entry.nsds5replicalastupdatestatus
+            print "  last update ended: %s" % str(ipautil.parse_generalized_time(entry.nsds5replicalastupdateend))
+    
+def del_master(replman, hostname, force=False):
+    try:
+        t = replman.get_agreement_type(hostname)
+    except ldap.NO_SUCH_OBJECT:
+        print "No replication agreement found for '%s'" % hostname
+        return
+    except errors.NotFound:
+        print "No replication agreement found for '%s'" % hostname
+        return
+
+    if t == replication.IPA_REPLICA:
+        try:
+            other_replman = replication.ReplicationManager(hostname, dirman_passwd=None)
+            other_replman.suffix = get_suffix()
+            other_replman.delete_agreement(replman.conn.host)
+        except Exception, e:
+            if force:
+                print "Unable to remove agreement on %s: %s" % (hostname, str(e))
+            else:
+                raise e
+
+    replman.delete_agreement(hostname)
+
+def add_master(replman, hostname, options):
+    other_args = {}
+    if options.port:
+        other_args['port'] = options.port
+    if options.binddn:
+        other_args['binddn'] = options.binddn
+    if options.bindpw:
+        other_args['bindpw'] = options.bindpw
+    if options.cacert:
+        other_args['cacert'] = options.cacert
+    if options.win_subtree:
+        other_args['win_subtree'] = options.win_subtree
+    if options.passsync:
+        other_args['passsync'] = options.passsync
+    if options.winsync:
+        other_args['winsync'] = True
+        if not options.binddn or not options.bindpw or not options.cacert or not options.passsync:
+            logging.error("The arguments --binddn, --bindpw, --passsync and --cacert are required to create a winsync agreement")
+            sys.exit(1)
+    if options.cacert:
+        # have to install the given CA cert before doing anything else
+        ds = dsinstance.DsInstance(realm_name = get_realm_name(),
+                                   dm_password = replman.dirman_passwd)
+        if not ds.add_ca_cert(options.cacert):
+            logging.error("Could not load the required CA certificate file [%s]" %
+                          options.cacert)
+            sys.exit(1)
+        else:
+            logging.info("Added CA certificate %s to certificate database for %s" %
+                         (options.cacert, replman.hostname))
+        # have to reconnect replman connection since the directory server was restarted
+        replman = replication.ReplicationManager(replman.hostname, replman.dirman_passwd)
+        logging.info("Restarted directory server " + replman.hostname)
+    replman.setup_replication(hostname, get_realm_name(), **other_args)
+    logging.info("Added agreement for other host " + hostname)
+
+def init_master(replman, dirman_passwd, hostname):
+    filter = "(&(nsDS5ReplicaHost=%s)(|(objectclass=nsDSWindowsReplicationAgreement)(objectclass=nsds5ReplicationAgreement)))" % hostname
+    entry = replman.conn.search_s("cn=config", ldap.SCOPE_SUBTREE, filter)
+    if len(entry) == 0:
+        logging.error("Unable to find replication agreement for %s" % hostname)
+        sys.exit(1)
+    if len(entry) > 1:
+        logging.error("Found multiple agreements for %s. Only initializing the first one returned: %s" % (hostname, entry[0].dn))
+    replman.initialize_replication(entry[0].dn, replman.conn)
+    ds = dsinstance.DsInstance(realm_name = get_realm_name(), dm_password = dirman_passwd)
+    ds.init_memberof()
+
+def synch_master(replman, hostname):
+    filter = "(&(nsDS5ReplicaHost=%s)(|(objectclass=nsDSWindowsReplicationAgreement)(objectclass=nsds5ReplicationAgreement)))" % hostname
+    entry = replman.conn.search_s("cn=config", ldap.SCOPE_SUBTREE, filter)
+    if len(entry) == 0:
+        logging.error("Unable to find replication agreement for %s" % hostname)
+        sys.exit(1)
+    if len(entry) > 1:
+        logging.error("Found multiple agreements for %s. Only initializing the first one returned: %s" % (hostname, entry[0].dn))
+    replman.force_synch(entry[0].dn, entry[0].nsds5replicaupdateschedule, replman.conn)
+
+def main():
+    options, args = parse_options()
+    
+    dirman_passwd = None
+
+    if options.dirman_passwd:
+        dirman_passwd = options.dirman_passwd
+    else:
+        if args[0] in ["add", "init"]:
+            dirman_passwd = getpass.getpass("Directory Manager password: ")
+
+    if options.host:
+        host = options.host
+    else:
+        host = get_host_name()
+
+    r = replication.ReplicationManager(host, dirman_passwd)
+    r.suffix = get_suffix()
+
+    if args[0] == "list":
+        list_masters(r, options.verbose)
+    elif args[0] == "del":
+        if len(args) != 2:
+            print "must provide hostname of master to delete"
+            sys.exit(1)
+        del_master(r, args[1], options.force)
+    elif args[0] == "add":
+        if len(args) != 2:
+            print "must provide hostname of master to add"
+            sys.exit(1)
+        add_master(r, args[1], options)
+    elif args[0] == "init":
+        if len(args) != 2:
+            print "hostname of master to initialize is required."
+            sys.exit(1)
+        init_master(r, dirman_passwd, args[1])
+    elif args[0] == "synch":
+        if len(args) != 2:
+            print "must provide hostname of supplier to synchronize with"
+            sys.exit(1)
+        synch_master(r, args[1])
+    else:
+        print "unknown command: %s" % args[0]
+        sys.exit(1)
+
+try:
+    main()
+except KeyboardInterrupt:
+    sys.exit(1)   
+except SystemExit, e:
+    sys.exit(e)
+except ldap.INVALID_CREDENTIALS:
+    print "Invalid password"
+    sys.exit(1)
+except ldap.INSUFFICIENT_ACCESS:
+    print "Insufficient access"
+    sys.exit(1)
+except ldap.LOCAL_ERROR, e:
+    print e.args[0]['info']
+    sys.exit(1)
+except Exception, e:
+    print "unexpected error: %s" % str(e)
+    sys.exit(1)

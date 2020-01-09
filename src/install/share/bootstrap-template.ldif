@@ -1,0 +1,230 @@
+dn: cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+objectClass: krbPwdPolicy
+cn: accounts
+krbMinPwdLife: 3600
+krbPwdMinDiffChars: 0
+krbPwdMinLength: 8
+krbPwdHistoryLength: 0
+krbMaxPwdLife: 7776000
+
+dn: cn=users,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+cn: users
+
+dn: cn=groups,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+cn: groups
+
+dn: cn=services,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+cn: services
+
+dn: cn=computers,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+cn: computers
+
+dn: cn=hbac,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: nsContainer
+cn: hbac
+
+dn: cn=etc,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: etc
+
+dn: cn=sysaccounts,cn=etc,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: sysaccounts
+
+dn: cn=ipa,cn=etc,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: ipa
+
+dn: cn=masters,cn=ipa,cn=etc,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: masters
+
+dn: uid=admin,cn=users,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: person
+objectClass: posixaccount
+objectClass: krbprincipalaux
+objectClass: krbticketpolicyaux
+objectClass: inetuser
+uid: admin
+krbPrincipalName: admin@$REALM
+cn: Administrator
+sn: Administrator
+uidNumber: $UIDSTART
+gidNumber: $GIDSTART
+homeDirectory: /home/admin
+loginShell: /bin/bash
+gecos: Administrator
+nsAccountLock: False
+
+dn: cn=radius,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: radius
+
+dn: cn=clients,cn=radius,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: clients
+
+dn: cn=profiles,cn=radius,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+cn: profiles
+
+dn: uid=ipa_default, cn=profiles,cn=radius,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: radiusprofile
+uid: ipa_default
+
+dn: cn=admins,cn=groups,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: groupofnames
+objectClass: posixgroup
+objectClass: ipausergroup
+cn: admins
+description: Account administrators group
+gidNumber: $GIDSTART
+member: uid=admin,cn=users,cn=accounts,$SUFFIX
+nsAccountLock: False
+
+dn: cn=ipausers,cn=groups,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: groupofnames
+objectClass: nestedgroup
+objectClass: ipausergroup
+objectClass: posixgroup
+gidNumber: eval($GIDSTART+1)
+description: Default group for all users
+cn: ipausers
+
+dn: cn=editors,cn=groups,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: groupofnames
+objectClass: posixgroup
+objectClass: ipausergroup
+gidNumber: eval($GIDSTART+2)
+description: Limited admins who can edit other users
+cn: editors
+
+dn: cn=ipaConfig,cn=etc,$SUFFIX
+changetype: add
+objectClass: nsContainer
+objectClass: top
+objectClass: ipaGuiConfig
+ipaUserSearchFields: uid,givenname,sn,telephonenumber,ou,title
+ipaGroupSearchFields: cn,description
+ipaSearchTimeLimit: 2
+ipaSearchRecordsLimit: 0
+ipaHomesRootDir: /home
+ipaDefaultLoginShell: /bin/sh
+ipaDefaultPrimaryGroup: ipausers
+ipaMaxUsernameLength: 8
+ipaPwdExpAdvNotify: 4
+ipaGroupObjectClasses: top
+ipaGroupObjectClasses: groupofnames
+ipaGroupObjectClasses: nestedgroup
+ipaGroupObjectClasses: ipausergroup
+ipaGroupObjectClasses: ipaobject
+ipaUserObjectClasses: top
+ipaUserObjectClasses: person
+ipaUserObjectClasses: organizationalperson
+ipaUserObjectClasses: inetorgperson
+ipaUserObjectClasses: inetuser
+ipaUserObjectClasses: posixaccount
+ipaUserObjectClasses: krbprincipalaux
+ipaUserObjectClasses: krbticketpolicyaux
+ipaUserObjectClasses: radiusprofile
+ipaUserObjectClasses: ipaobject
+ipaDefaultEmailDomain: $DOMAIN
+ipaMigrationEnabled: FALSE
+
+dn: cn=account inactivation,cn=accounts,$SUFFIX
+changetype: add
+description: Lock accounts based on group membership
+objectClass: top
+objectClass: ldapsubentry
+objectClass: cosSuperDefinition
+objectClass: cosClassicDefinition
+cosTemplateDn: cn=cosTemplates,cn=accounts,$SUFFIX
+cosAttribute: nsAccountLock operational
+cosSpecifier: memberOf
+cn: Account Inactivation
+
+dn: cn=cosTemplates,cn=accounts,$SUFFIX
+changetype: add
+objectclass: top
+objectclass: nsContainer
+cn: cosTemplates
+
+dn: cn=cn\=inactivated\,cn\=account inactivation\,cn\=accounts\,$ESCAPED_SUFFIX,cn=cosTemplates,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: cosTemplate
+objectClass: extensibleobject
+nsAccountLock: true
+cosPriority: 1
+
+dn: cn=inactivated,cn=account inactivation,cn=accounts,$SUFFIX
+changetype: add
+objectclass: top
+objectclass: groupofnames
+
+dn: cn=cn\=activated\,cn\=account inactivation\,cn\=accounts\,$ESCAPED_SUFFIX,cn=cosTemplates,cn=accounts,$SUFFIX
+changetype: add
+objectClass: top
+objectClass: cosTemplate
+objectClass: extensibleobject
+nsAccountLock: false
+cosPriority: 0
+
+dn: cn=Activated,cn=Account Inactivation,cn=accounts,$SUFFIX
+changetype: add
+objectclass: top
+objectclass: groupofnames
+
+# templates for this cos definition are managed by the pwpolicy plugin
+dn: cn=Password Policy,cn=accounts,$SUFFIX
+changetype: add
+description: Password Policy based on group membership
+objectClass: top
+objectClass: ldapsubentry
+objectClass: cosSuperDefinition
+objectClass: cosClassicDefinition
+cosTemplateDn: cn=cosTemplates,cn=accounts,$SUFFIX
+cosAttribute: krbPwdPolicyReference
+cosSpecifier: memberOf
+

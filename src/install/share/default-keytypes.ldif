@@ -1,0 +1,31 @@
+#kerberos keytypes
+dn: cn=$REALM,cn=kerberos,$SUFFIX
+changetype: modify
+add: krbSupportedEncSaltTypes
+krbSupportedEncSaltTypes: aes256-cts:normal
+krbSupportedEncSaltTypes: aes128-cts:normal
+krbSupportedEncSaltTypes: des3-hmac-sha1:normal
+krbSupportedEncSaltTypes: arcfour-hmac:normal
+krbSupportedEncSaltTypes: des-hmac-sha1:normal
+krbSupportedEncSaltTypes: des-cbc-md5:normal
+krbSupportedEncSaltTypes: des-cbc-crc:normal
+krbSupportedEncSaltTypes: des-cbc-crc:v4
+krbSupportedEncSaltTypes: des-cbc-crc:afs3
+-
+add: krbMaxTicketLife
+krbMaxTicketLife: 86400
+-
+add: krbMaxRenewableAge
+krbMaxRenewableAge: 604800
+
+#kerberos keytypes
+dn: cn=$REALM,cn=kerberos,$SUFFIX
+changetype: modify
+add: krbDefaultEncSaltTypes
+krbDefaultEncSaltTypes: aes256-cts:normal
+krbDefaultEncSaltTypes: aes128-cts:normal
+krbDefaultEncSaltTypes: des3-hmac-sha1:normal
+krbDefaultEncSaltTypes: arcfour-hmac:normal
+krbDefaultEncSaltTypes: des-hmac-sha1:normal
+krbDefaultEncSaltTypes: des-cbc-md5:normal
+

@@ -1,0 +1,708 @@
+#! /usr/bin/python -E
+# Authors: Simo Sorce <ssorce@redhat.com>
+#          Karl MacMillan <kmacmillan@mentalrootkit.com>
+#
+# Copyright (C) 2007  Red Hat
+# see file 'COPYING' for use and warranty information
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; version 2 only
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+
+try:
+    import sys
+
+    import os
+    import krbV
+    import socket
+    import logging
+    import tempfile
+    import getpass
+    from optparse import OptionParser
+    import ipaclient.ipadiscovery
+    import ipaclient.ipachangeconf
+    import ipaclient.ntpconf
+    from ipapython.ipautil import run, user_input, CalledProcessError
+    from ipapython import sysrestore
+    from ipapython import version
+    import SSSDConfig
+except ImportError:
+    print >> sys.stderr, """\
+There was a problem importing one of the required Python modules. The
+error was:
+
+    %s
+""" % sys.exc_value
+    sys.exit(1)
+
+
+def parse_options():
+    parser = OptionParser(version=version.VERSION)
+    parser.add_option("--domain", dest="domain", help="domain name")
+    parser.add_option("--server", dest="server", help="IPA server")
+    parser.add_option("--realm", dest="realm_name", help="realm name")
+    parser.add_option("-f", "--force", dest="force", action="store_true",
+                      default=False, help="force setting of ldap/kerberos conf")
+    parser.add_option("-d", "--debug", dest="debug", action="store_true",
+                      default=False, help="print debugging information")
+    parser.add_option("-U", "--unattended", dest="unattended",
+                      action="store_true",
+                      help="unattended installation never prompts the user")
+    parser.add_option("--ntp-server", dest="ntp_server", help="ntp server to use")
+    parser.add_option("-S", "--no-sssd", action="store_false",
+                      help="do not configure sssd", default=True, dest="sssd")
+    parser.add_option("-N", "--no-ntp", action="store_false",
+                      help="do not configure ntp", default=True, dest="conf_ntp")
+    parser.add_option("-w", "--password", dest="password",
+                      help="password to join the IPA realm (assumes bulk password unless principal is also set)"),
+    parser.add_option("-W", dest="prompt_password", action="store_true",
+                      default=False,
+                      help="Prompt for a password to join the IPA realm"),
+    parser.add_option("-p", "--principal", dest="principal",
+                      help="principal to use to join the IPA realm"),
+    parser.add_option("--on-master", dest="on_master", action="store_true",
+                      help="use this option when run on a master", default=False)
+    parser.add_option("--permit", dest="permit", action="store_true",
+                      help="disable access rules by default, permit all access.", default=False)
+    parser.add_option("--mkhomedir", dest="mkhomedir", action="store_true",
+                      help="create home directories for users on their first login", default=False)
+    parser.add_option("", "--uninstall", dest="uninstall", action="store_true",
+                      default=False, help="uninstall an existing installation")
+
+    options, args = parser.parse_args()
+
+    if (options.server and not options.domain):
+        parser.error("--server cannot be used without providing --domain")
+
+    return options
+
+def logging_setup(options):
+    # Always log everything (i.e., DEBUG) to the log
+    # file.
+
+    log_file = "/var/log/ipaclient-install.log"
+    if options.uninstall:
+        log_file = "/var/log/ipaclient-uninstall.log"
+
+    old_umask = os.umask(077)
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s',
+                        filename=log_file,
+                        filemode='w')
+    os.umask(old_umask)
+
+    console = logging.StreamHandler()
+    # If the debug option is set, also log debug messages to the console
+    if options.debug:
+        console.setLevel(logging.DEBUG)
+    else:
+        # Otherwise, log critical and error messages
+        console.setLevel(logging.ERROR)
+    formatter = logging.Formatter('%(name)-12s: %(levelname)-8s %(message)s')
+    console.setFormatter(formatter)
+    logging.getLogger('').addHandler(console)
+
+def nickname_exists(nickname):
+        (sout, serr, returncode) = run(["/usr/bin/certutil", "-L", "-d", "/etc/pki/nssdb", "-n", nickname], raiseonerr=False)
+
+        if returncode == 0:
+            return True
+        else:
+            return False
+
+def service(name, status):
+    """
+    Run a System V init script 'name' with the status 'status'
+
+    The return value of /sbin/service name start/stop/status is:
+
+    0 - Ok
+    1 - unrecognized service, bad usage
+    > 1 - generally command-specific
+
+    For status == 'status' it means:
+    0 - running
+    1 - dead but pid file exists
+    2 - dead but sybsys locked
+    3 - stopped
+    """
+    (sout, serr, returncode) = run(['/sbin/service', name, 'status'], raiseonerr=False)
+
+    # If the service isn't installed return with no error
+    if returncode == 1:
+        return
+
+    args = ['/sbin/service', name, status]
+    (sout, serr, returncode) = run(args, raiseonerr=False)
+
+    if returncode != 0:
+        raise CalledProcessError(returncode, ' '.join(args))
+
+    return
+
+def chkconfig(name, status):
+    """
+    Set startup of service 'name' to 'status' (on or off)
+
+    chkconfig returns 1 if the service is unknown, 0 otherwise
+    """
+    (sout, serr, returncode) = run(['/sbin/chkconfig', name, '--list'], raiseonerr=False)
+
+    # If the service isn't installed return with no error
+    if returncode == 1:
+        return
+
+    args = ['/sbin/chkconfig', name, status]
+    (sout, serr, returncode) = run(args, raiseonerr=False)
+
+    if returncode != 0:
+        raise CalledProcessError(returncode, ' '.join(args))
+
+    return
+
+def uninstall(options):
+
+    if not fstore.has_files() and not options.force:
+        print "IPA client is not configured on this system."
+        return 1
+
+    # Remove our host cert and CA cert
+    if nickname_exists("IPA CA"):
+        try:
+            run(["/usr/bin/certutil", "-D", "-d", "/etc/pki/nssdb", "-n", "IPA CA"])
+        except Exception, e:
+            print "Failed to remove IPA CA from /etc/pki/nssdb: %s" % str(e)
+    if nickname_exists("Server-Cert"):
+        try:
+            run(["/usr/bin/certutil", "-D", "-d", "/etc/pki/nssdb", "-n", "Server-Cert"])
+        except Exception, e:
+            print "Failed to remove Server-Cert from /etc/pki/nssdb: %s" % str(e)
+        try:
+            run(["/usr/bin/ipa-getcert", "stop-tracking", "-d", "/etc/pki/nssdb", "-n", "Server-Cert"])
+        except Exception, e:
+            print "Failed to stop tracking Server-Cert in certmonger: %s" % str(e)
+
+    try:
+        service('certmonger', 'stop')
+    except:
+        print "Failed to stop the certmonger daemon"
+
+    try:
+        chkconfig('certmonger', 'off')
+    except:
+        print "Failed to disable automatic startup of the certmonger daemon"
+
+    print "Removing Kerberos service principals from /etc/krb5.keytab"
+    try:
+        ctx = krbV.default_context()
+        run(["/usr/sbin/ipa-rmkeytab", "-k", "/etc/krb5.keytab", "-r", ctx.default_realm])
+    except:
+        print "Failed to clean up /etc/krb5.keytab"
+
+    print "Disabling client Kerberos and Ldap configurations"
+    try:
+        run(["/usr/sbin/authconfig", "--disableldap", "--disablekrb5", "--disablesssd", "--disablesssdauth", "--disablemkhomedir", "--update"])
+    except Exception, e:
+        print "Failed to remove krb5/ldap configuration. " +str(e)
+        sys.exit(1)
+
+    print "Restoring client configuration files"
+    fstore.restore_all_files()
+
+    try:
+        service('nscd', 'restart')
+    except:
+        print "Failed to restart start the NSCD daemon"
+
+    try:
+        chkconfig('nscd', 'on')
+    except:
+        print "Failed to configure automatic startup of the NSCD daemon"
+
+    if not options.unattended:
+        print "The original nsswitch.conf configuration has been restored."
+        print "You may need to restart services or reboot the machine."
+        if not options.on_master:
+            if user_input("Do you want to reboot the machine?", False):
+                try:
+                    run(["/usr/bin/reboot"])
+                except Exception, e:
+                    print "Reboot command failed to exceute. " + str(e)
+                    sys.exit(1)
+
+    # Remove the IPA configuration file
+    try:
+        os.remove("/etc/ipa/default.conf")
+    except:
+        pass
+
+def configure_ipa_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server):
+    ipaconf = ipaclient.ipachangeconf.IPAChangeConf("IPA Installer")
+    ipaconf.setOptionAssignment(" = ")
+    ipaconf.setSectionNameDelimiters(("[","]"))
+
+    opts = [{'name':'comment', 'type':'comment', 'value':'File modified by ipa-client-install'},
+            {'name':'empty', 'type':'empty'}]
+
+    #[global]
+    defopts = [{'name':'basedn', 'type':'option', 'value':cli_basedn},
+               {'name':'realm', 'type':'option', 'value':cli_realm},
+               {'name':'domain', 'type':'option', 'value':cli_domain},
+               {'name':'server', 'type':'option', 'value':cli_server},
+               {'name':'xmlrpc_uri', 'type':'option', 'value':'https://%s/ipa/xml' % cli_server},
+               {'name':'enable_ra', 'type':'option', 'value':'True'}]
+
+    opts.append({'name':'global', 'type':'section', 'value':defopts})
+    opts.append({'name':'empty', 'type':'empty'})
+
+    fstore.backup_file("/etc/ipa/default.conf")
+    ipaconf.newConf("/etc/ipa/default.conf", opts)
+
+    return 0
+
+def configure_ldap_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server, dnsok, options):
+    ldapconf = ipaclient.ipachangeconf.IPAChangeConf("IPA Installer")
+    ldapconf.setOptionAssignment(" ")
+
+    opts = [{'name':'comment', 'type':'comment', 'value':'File modified by ipa-client-install'},
+            {'name':'empty', 'type':'empty'},
+            {'name':'ldap_version', 'type':'option', 'value':'3'},
+            {'name':'base', 'type':'option', 'value':cli_basedn},
+            {'name':'empty', 'type':'empty'},
+            {'name':'nss_base_passwd', 'type':'option', 'value':'cn=users,cn=accounts,'+cli_basedn+'?sub'},
+            {'name':'nss_base_group', 'type':'option', 'value':'cn=groups,cn=accounts,'+cli_basedn+'?sub'},
+            {'name':'nss_schema', 'type':'option', 'value':'rfc2307bis'},
+            {'name':'nss_map_attribute', 'type':'option', 'value':'uniqueMember member'},
+            {'name':'nss_initgroups_ignoreusers', 'type':'option', 'value':'root,dirsrv'},
+            {'name':'empty', 'type':'empty'},
+            {'name':'nss_reconnect_maxsleeptime', 'type':'option', 'value':'8'},
+            {'name':'nss_reconnect_sleeptime', 'type':'option', 'value':'1'},
+            {'name':'bind_timelimit', 'type':'option', 'value':'5'},
+            {'name':'timelimit', 'type':'option', 'value':'15'},
+            {'name':'empty', 'type':'empty'}]
+    if not dnsok or options.force or options.on_master:
+        if options.on_master:
+            opts.append({'name':'uri', 'type':'option', 'value':'ldap://localhost'})
+        else:
+            opts.append({'name':'uri', 'type':'option', 'value':'ldap://'+cli_server})
+    else:
+        opts.append({'name':'nss_srv_domain', 'type':'option', 'value':cli_domain})
+
+    opts.append({'name':'empty', 'type':'empty'})
+    try:
+        fstore.backup_file("/etc/ldap.conf")
+        ldapconf.newConf("/etc/ldap.conf", opts)
+    except Exception, e:
+        print "Creation of /etc/ldap.conf: " + str(e)
+        return 1
+
+    return 0
+
+def hardcode_ldap_server(cli_server):
+    """
+    DNS Discovery didn't return a valid IPA server, hardcode a value into
+    the file instead.
+    """
+    ldapconf = ipaclient.ipachangeconf.IPAChangeConf("IPA Installer")
+    ldapconf.setOptionAssignment(" ")
+
+    opts = [{'name':'uri', 'type':'option', 'action':'set', 'value':'ldap://'+cli_server},
+            {'name':'empty', 'type':'empty'}]
+
+    # Errors raised by this should be caught by the caller
+    ldapconf.changeConf("/etc/ldap.conf", opts)
+
+    return
+
+def configure_krb5_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server, dnsok, options, filename):
+
+    krbconf = ipaclient.ipachangeconf.IPAChangeConf("IPA Installer")
+    krbconf.setOptionAssignment(" = ")
+    krbconf.setSectionNameDelimiters(("[","]"))
+    krbconf.setSubSectionDelimiters(("{","}"))
+    krbconf.setIndent(("","  ","    "))
+
+    opts = [{'name':'comment', 'type':'comment', 'value':'File modified by ipa-client-install'},
+            {'name':'empty', 'type':'empty'}]
+
+    #[libdefaults]
+    libopts = [{'name':'default_realm', 'type':'option', 'value':cli_realm}]
+    if not dnsok or options.force:
+        libopts.append({'name':'dns_lookup_realm', 'type':'option', 'value':'false'})
+        libopts.append({'name':'dns_lookup_kdc', 'type':'option', 'value':'false'})
+    else:
+        libopts.append({'name':'dns_lookup_realm', 'type':'option', 'value':'true'})
+        libopts.append({'name':'dns_lookup_kdc', 'type':'option', 'value':'true'})
+    libopts.append({'name':'ticket_lifetime', 'type':'option', 'value':'24h'})
+    libopts.append({'name':'forwardable', 'type':'option', 'value':'yes'})
+
+    opts.append({'name':'libdefaults', 'type':'section', 'value':libopts})
+    opts.append({'name':'empty', 'type':'empty'})
+
+    #the following are necessary only if DNS discovery does not work
+    if not dnsok or options.force:
+        #[realms]
+        kropts =[{'name':'kdc', 'type':'option', 'value':cli_server+':88'},
+                 {'name':'admin_server', 'type':'option', 'value':cli_server+':749'},
+                 {'name':'default_domain', 'type':'option', 'value':cli_domain}]
+        ropts = [{'name':cli_realm, 'type':'subsection', 'value':kropts}]
+        opts.append({'name':'realms', 'type':'section', 'value':ropts})
+        opts.append({'name':'empty', 'type':'empty'})
+
+    #[domain_realm]
+    dropts = [{'name':'.'+cli_domain, 'type':'option', 'value':cli_realm},
+              {'name':cli_domain, 'type':'option', 'value':cli_realm}]
+    opts.append({'name':'domain_realm', 'type':'section', 'value':dropts})
+    opts.append({'name':'empty', 'type':'empty'})
+
+    #[appdefaults]
+    pamopts = [{'name':'debug', 'type':'option', 'value':'false'},
+               {'name':'ticket_lifetime', 'type':'option', 'value':'36000'},
+               {'name':'renew_lifetime', 'type':'option', 'value':'36000'},
+               {'name':'forwardable', 'type':'option', 'value':'true'},
+               {'name':'krb4_convert', 'type':'option', 'value':'false'}]
+    appopts = [{'name':'pam', 'type':'subsection', 'value':pamopts}]
+    opts.append({'name':'appdefaults', 'type':'section', 'value':appopts})
+
+    krbconf.newConf(filename, opts);
+
+    return 0
+
+def configure_certmonger(fstore, subject_base, cli_realm, options):
+    started = True
+
+    try:
+        service('certmonger', 'restart')
+    except:
+        print "Failed to start the certmonger daemon"
+        print "Automatic certificate management will not be available"
+        started = False
+
+    try:
+        chkconfig('certmonger', 'on')
+    except:
+        print "Failed to configure automatic startup of the certmonger daemon"
+        print "Automatic certificate management will not be available"
+
+    # Request our host cert
+    if started:
+        subject = 'CN=%s,%s' % (socket.getfqdn(), subject_base)
+        principal = 'host/%s@%s' % (socket.getfqdn(), cli_realm)
+        try:
+            run(["ipa-getcert", "request", "-d", "/etc/pki/nssdb", "-n", "Server-Cert", "-N", subject, "-K", principal])
+        except:
+            print "certmonger request for host certificate failed"
+
+def configure_sssd_conf(fstore, cli_domain, cli_server, options):
+    fstore.backup_file("/etc/sssd/sssd.conf")
+    sssdconfig = SSSDConfig.SSSDConfig()
+    sssdconfig.new_config()
+
+    domain = sssdconfig.new_domain(cli_domain)
+    domain.add_provider('ipa', 'id')
+
+    domain.set_option('ipa_server', cli_server)
+    domain.set_option('ipa_domain', cli_domain)
+
+    # Might need this if /bin/hostname doesn't return a FQDN
+    #domain.set_option('ipa_hostname', 'client.example.com')
+
+    domain.add_provider('ipa', 'auth')
+    domain.add_provider('ipa', 'chpass')
+    if not options.permit:
+        domain.add_provider('ipa', 'access')
+    else:
+        domain.add_provider('permit', 'access')
+
+    domain.set_option('cache_credentials', True)
+
+    domain.set_active(True)
+
+    sssdconfig.save_domain(domain)
+    sssdconfig.write("/etc/sssd/sssd.conf")
+
+    return 0
+
+def main():
+    options = parse_options()
+    logging_setup(options)
+    dnsok = True
+
+    global fstore
+    fstore = sysrestore.FileStore('/var/lib/ipa-client/sysrestore')
+
+    if options.uninstall:
+        return uninstall(options)
+
+    if fstore.has_files() and not options.force:
+        print "IPA client is already configured on this system."
+        return 1
+
+    cli_domain = None
+    cli_server = None
+    cli_realm = None
+    cli_basedn = None
+
+    subject_base = "O=IPA"
+
+    if options.unattended and (options.password is None and options.principal is None and options.prompt_password is False) and not options.on_master:
+        print "One of password and principal are required."
+        return 1
+
+    # Create the discovery instance
+    ds = ipaclient.ipadiscovery.IPADiscovery()
+
+    ret = ds.search(domain=options.domain, server=options.server)
+    if ret == -10:
+        print "Can't get the fully qualified name of this host"
+        print "Please check that the client is properly configured"
+        return ret
+    if ret == -1 or not ds.getDomainName():
+        logging.debug("Domain not found")
+        if options.domain:
+            cli_domain = options.domain
+        elif options.unattended:
+            return ret
+        else:
+            print "DNS discovery failed to determine your DNS domain"
+            cli_domain = user_input("Please provide the domain name of your IPA server (ex: example.com)", allow_empty = False)
+        ret = ds.search(domain=cli_domain, server=options.server)
+    if not cli_domain:
+        if ds.getDomainName():
+            cli_domain = ds.getDomainName()
+
+    if ret == -2 or not ds.getServerName():
+        dnsok = False
+        logging.debug("IPA Server not found")
+        if options.server:
+            cli_server = options.server
+        elif options.unattended:
+            return ret
+        else:
+            print "DNS discovery failed to find the IPA Server"
+            cli_server = user_input("Please provide your IPA server name (ex: ipa.example.com)", allow_empty = False)
+        ret = ds.search(domain=cli_domain, server=cli_server)
+    if not cli_server:
+        if ds.getServerName():
+            cli_server = ds.getServerName()
+
+    if ret != 0:
+        print "Failed to verify that "+cli_server+" is an IPA Server."
+        print "This may mean that the remote server is not up or is not reachable"
+        print "due to network or firewall settings."
+        return ret
+
+    if dnsok:
+        print "Discovery was successful!"
+    elif not options.unattended:
+        print "\nThe failure to use DNS to find your IPA server indicates that your"
+        print "resolv.conf file is not properly configured.\n"
+        print "Autodiscovery of servers for failover cannot work with this configuration.\n"
+        print "If you proceed with the installation, services will be configured to always"
+        print "access the discovered server for all operation and will not fail over to"
+        print "other servers in case of failure.\n"
+        if not user_input("Do you want to proceed and configure the system with fixed values with no DNS discovery?", False):
+            return ret
+
+    if options.realm_name and options.realm_name != ds.getRealmName():
+        if not options.unattended:
+            print "ERROR: The provided realm name: ["+options.realm_name+"] does not match with the discovered one: ["+ds.getRealmName()+"]\n"
+        return -3
+
+    cli_realm = ds.getRealmName()
+    cli_basedn = ds.getBaseDN()
+
+    print "Realm: "+cli_realm
+    print "DNS Domain: "+cli_domain
+    print "IPA Server: "+cli_server
+    print "BaseDN: "+cli_basedn
+
+    print "\n"
+    if not options.unattended and not user_input("Continue to configure the system with these values?", False):
+        return 1
+
+    if not options.unattended:
+        if options.principal is None and options.password is None and options.prompt_password is False:
+            options.principal = user_input("Principal", allow_empty=False)
+
+    if not options.on_master:
+        # First test out the kerberos configuration
+        try:
+            (krb_fd, krb_name) = tempfile.mkstemp()
+            os.close(krb_fd)
+            if configure_krb5_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server, dnsok, options, krb_name):
+                print "Test kerberos configuration failed"
+                return 1
+            os.environ['KRB5_CONFIG'] = krb_name
+            join_args = ["/usr/sbin/ipa-join", "-s", cli_server]
+            if options.debug:
+                join_args.append("-d")
+            if options.principal is not None:
+                stdin = None
+                principal = options.principal
+                if principal.find('@') == -1:
+                    principal = '%s@%s' % (principal, cli_realm)
+                if options.password is not None:
+                    stdin = options.password
+                else:
+                    if not options.unattended:
+                        print "Password for %s: " % principal,
+                        sys.stdout.flush()
+                    else:
+                        if sys.stdin.isatty():
+                            print "Password must be provided in non-interactive mode"
+                            return 1
+                        else:
+                            stdin = sys.stdin.readline()
+
+                (stderr, stdout, returncode) = run(["/usr/kerberos/bin/kinit", principal], raiseonerr=False, stdin=stdin)
+                print ""
+                if returncode != 0:
+                    print stdout
+                    return 1
+            elif options.password:
+                join_args.append("-w")
+                join_args.append(options.password)
+            elif options.prompt_password:
+                if options.unattended:
+                    print "Password must be provided in non-interactive mode"
+                    return 1
+                password = getpass.getpass("Password: ")
+                join_args.append("-w")
+                join_args.append(password)
+
+            # Now join the domain
+            (stdout, stderr, returncode) = run(join_args, raiseonerr=False)
+
+            if returncode != 0:
+                print "Joining realm failed: %s" % stderr,
+                if not options.force:
+                    return 1
+                print "  Use ipa-getkeytab to obtain a host principal for this server."
+
+            start = stderr.find('Certificate subject base is: ')
+            if start >= 0:
+                start = start + 29
+                subject_base = stderr[start:]
+                subject_base = subject_base.strip()
+
+        finally:
+            if options.principal is not None:
+                (stderr, stdout, returncode) = run(["/usr/kerberos/bin/kdestroy"], raiseonerr=False)
+            del os.environ['KRB5_CONFIG']
+            os.remove(krb_name)
+            os.remove(krb_name + ".ipabkp")
+
+    # Configure ipa.conf
+    if not options.on_master:
+        configure_ipa_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server)
+        print "Created /etc/ipa/default.conf"
+
+    if options.sssd:
+        if configure_sssd_conf(fstore, cli_domain, cli_server, options):
+            return 1
+        print "Configured /etc/sssd/sssd.conf"
+    else:
+        if configure_ldap_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server, dnsok, options):
+            return 1
+        print "Configured /etc/ldap.conf"
+
+    # Get the CA certificate
+    run(["/usr/bin/wget", "-O", "/etc/ipa/ca.crt", "http://%s/ipa/config/ca.crt" % cli_server])
+    # Add the CA to the default NSS database and trust it
+    run(["/usr/bin/certutil", "-A", "-d", "/etc/pki/nssdb", "-n", "IPA CA", "-t", "CT,C,C", "-a", "-i", "/etc/ipa/ca.crt"])
+
+
+    # If on master assume kerberos is already configured properly.
+    if not options.on_master:
+        # Configure krb5.conf
+        fstore.backup_file("/etc/krb5.conf")
+        if configure_krb5_conf(fstore, cli_basedn, cli_realm, cli_domain, cli_server, dnsok, options, "/etc/krb5.conf"):
+            return 1
+
+        print "Configured /etc/krb5.conf for IPA realm " + cli_realm
+
+        configure_certmonger(fstore, subject_base, cli_realm, options)
+
+    # Modify nsswitch/pam stack
+    if options.sssd:
+        cmd = ["/usr/sbin/authconfig", "--enablesssd", "--enablesssdauth", "--update"]
+        message = "SSSD enabled"
+    else:
+        cmd = ["/usr/sbin/authconfig", "--enableldap", "--update"]
+        message = "LDAP enabled"
+
+    if options.mkhomedir:
+        cmd.append("--enablemkhomedir")
+    run(cmd)
+    print message
+
+    #Check nss_ldap is working properly
+    if not options.on_master:
+        try:
+            run(["getent", "passwd", "admin"])
+        except Exception, e:
+            print "nss_ldap is not able to use DNS discovery!"
+            print "Changing configuration to use hardcoded server name: " +cli_server
+
+            try:
+                hardcode_ldap_server(cli_server)
+            except Exception, e:
+                print "Adding hardcoded server name to /etc/ldap.conf failed: " + str(e)
+                return 1
+
+    #Modify pam to add pam_krb5
+    run(["/usr/sbin/authconfig", "--enablekrb5", "--update", "--nostart"])
+    print "Kerberos 5 enabled"
+
+    if options.conf_ntp and not options.on_master:
+        if options.ntp_server:
+            ntp_server = options.ntp_server
+        else:
+            ntp_server = cli_server
+        ipaclient.ntpconf.config_ntp(ntp_server, fstore)
+        print "NTP enabled"
+
+    if options.sssd:
+        nscd_action = "stop"
+        nscd_status = "off"
+    else:
+        nscd_action = "restart"
+        nscd_status = "on"
+
+    #Name Server Caching Daemon. Disable for SSSD, use otherwise
+    try:
+        service('nscd', nscd_action)
+    except:
+        print "Failed to %s the NSCD daemon" % nscd_action
+        if not options.sssd:
+            print "Caching of users/groups will not be available"
+
+    try:
+        chkconfig('nscd', nscd_status)
+    except:
+        print "Failed to configure automatic startup of the NSCD daemon"
+        if not options.sssd:
+            print "Caching of users/groups will not be available after reboot"
+
+    print "Client configuration complete."
+
+    return 0
+
+try:
+    if __name__ == "__main__":
+        sys.exit(main())
+except SystemExit, e:
+    sys.exit(e)
+except KeyboardInterrupt:
+    sys.exit(1)

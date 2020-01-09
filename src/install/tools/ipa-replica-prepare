@@ -1,0 +1,353 @@
+#! /usr/bin/python -E
+# Authors: Karl MacMillan <kmacmillan@mentalrootkit.com>
+#
+# Copyright (C) 2007  Red Hat
+# see file 'COPYING' for use and warranty information
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation; version 2 only
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+
+import sys
+
+import logging, tempfile, shutil, os, pwd
+import traceback
+from ConfigParser import SafeConfigParser
+import krbV
+from optparse import OptionParser
+
+from ipapython import ipautil
+from ipaserver.install import bindinstance, dsinstance, installutils, certs, httpinstance
+from ipaserver.install.bindinstance import add_zone, add_reverze_zone, add_rr, add_ptr_rr
+from ipaserver.plugins.ldap2 import ldap2
+from ipapython import version
+from ipalib import api, errors, util
+
+def parse_options():
+    usage = "%prog [options] FQDN (e.g. replica.example.com)"
+    parser = OptionParser(usage=usage, version=version.VERSION)
+
+    parser.add_option("--dirsrv_pkcs12", dest="dirsrv_pkcs12",
+                      help="install certificate for the directory server")
+    parser.add_option("--http_pkcs12", dest="http_pkcs12",
+                      help="install certificate for the http server")
+    parser.add_option("--dirsrv_pin", dest="dirsrv_pin",
+                      help="PIN for the Directory Server PKCS#12 file")
+    parser.add_option("--http_pin", dest="http_pin",
+                      help="PIN for the Apache Server PKCS#12 file")
+    parser.add_option("-p", "--password", dest="password", 
+                      help="Directory Manager (existing master) password")
+    parser.add_option("--ip-address", dest="ip_address",
+                      help="Add A and PTR records of the future replica")
+    parser.add_option("--ca", dest="ca_file", default="/root/cacert.p12",
+                      help="Location of CA PKCS#12 file, default /root/cacert.p12")
+
+    options, args = parser.parse_args()
+
+    # If any of the PKCS#12 options are selected, all are required. Create a
+    # list of the options and count it to enforce that all are required without
+    # having a huge set of it blocks.
+    pkcs12 = [options.dirsrv_pkcs12, options.http_pkcs12, options.dirsrv_pin, options.http_pin]
+    cnt = pkcs12.count(None)
+    if cnt > 0 and cnt < 4:
+        parser.error("All PKCS#12 options are required if any are used.")
+
+    if options.ip_address:
+        if not installutils.verify_ip_address(options.ip_address):
+            parser.error("Bad IP address")
+            sys.exit(1)
+
+    if len(args) != 1:
+        parser.error("must provide the fully-qualified name of the replica")
+
+    return options, args
+
+def get_subject_base(host_name, dm_password, suffix):
+    ldapuri = 'ldap://%s:389' % host_name
+    try:
+        conn = ldap2(shared_instance=False, ldap_uri=ldapuri, base_dn=suffix)
+        conn.connect(bind_dn='cn=directory manager', bind_pw=dm_password)
+    except errors.ExecutionError, e:
+        logging.critical("Could not connect to the Directory Server on %s" % host_name)
+        raise e
+    (dn, entry_attrs) = conn.get_ipa_config()
+    conn.disconnect()
+    return entry_attrs.get('ipacertificatesubjectbase', [None])[0]
+
+def check_ipa_configuration(realm_name):
+    config_dir = dsinstance.config_dirname(dsinstance.realm_to_serverid(realm_name))
+    if not ipautil.dir_exists(config_dir):
+        logging.error("could not find directory instance: %s" % config_dir)
+        sys.exit(1)
+
+def export_certdb(realm_name, ds_dir, dir, passwd_fname, fname, hostname, subject_base=None):
+    """realm is the kerberos realm for the IPA server.
+       ds_dir is the location of the master DS we are creating a replica for.
+       dir is the location of the files for the replica we are creating.
+       passwd_fname is the file containing the PKCS#12 password
+       fname is the filename of the PKCS#12 file for this cert (minus the .p12).
+       hostname is the FQDN of the server we're creating a cert for.
+
+       The subject is handled by certs.CertDB:create_server_cert()
+    """
+    try:
+        self_signed = certs.ipa_self_signed()
+
+        db = certs.CertDB(dir, subject_base=subject_base)
+        db.create_passwd_file()
+#        if self_signed:
+#            ca_db = certs.CertDB(dsinstance.config_dirname(dsinstance.realm_to_serverid(realm_name)))
+#            db.create_from_cacert(ca_db.cacert_fname)
+#        else:
+#            ca_db = certs.CertDB(httpinstance.NSS_DIR, host_name=api.env.host)
+        ca_db = certs.CertDB(httpinstance.NSS_DIR, host_name=api.env.host, subject_base=subject_base)
+        db.create_from_cacert(ca_db.cacert_fname)
+        db.create_server_cert("Server-Cert", hostname, ca_db)
+    except Exception, e:
+        raise e
+
+    pkcs12_fname = dir + "/" + fname + ".p12"
+
+    try:
+        db.export_pkcs12(pkcs12_fname, passwd_fname, "Server-Cert")
+    except ipautil.CalledProcessError, e:
+        print "error exporting Server certificate: " + str(e)
+        remove_file(pkcs12_fname)
+        remove_file(passwd_fname)
+
+    remove_file(dir + "/cert8.db")
+    remove_file(dir + "/key3.db")
+    remove_file(dir + "/secmod.db")
+    remove_file(dir + "/noise.txt")
+    if ipautil.file_exists(passwd_fname + ".orig"):
+        remove_file(passwd_fname + ".orig")
+
+def export_ra_pkcs12(dir, dm_password):
+    """
+       dir is the location of the files for the replica we are creating.
+       dm_password is the Directory Manager password
+
+       If this install is using dogtag/RHCS then export the RA certificate.
+    """
+    if certs.ipa_self_signed():
+        return
+
+    (agent_fd, agent_name) = tempfile.mkstemp()
+    os.write(agent_fd, dm_password)
+    os.close(agent_fd)
+
+    try:
+        try:
+            db = certs.CertDB(httpinstance.NSS_DIR, host_name=api.env.host)
+
+            if db.has_nickname("ipaCert"):
+                pkcs12_fname = "%s/ra.p12" % dir
+                db.export_pkcs12(pkcs12_fname, agent_name, "ipaCert")
+        except Exception, e:
+            raise e
+    finally:
+        os.remove(agent_name)
+
+def get_ds_user(ds_dir):
+    uid = os.stat(ds_dir).st_uid
+    user = pwd.getpwuid(uid)[0]
+
+    return user
+
+def save_config(dir, realm_name, host_name, ds_user, domain_name, dest_host,
+                subject_base):
+    config = SafeConfigParser()
+    config.add_section("realm")
+    config.set("realm", "realm_name", realm_name)
+    config.set("realm", "master_host_name", host_name)
+    config.set("realm", "ds_user", ds_user)
+    config.set("realm", "domain_name", domain_name)
+    config.set("realm", "destination_host", dest_host)
+    config.set("realm", "subject_base", subject_base)
+    fd = open(dir + "/realm_info", "w")
+    config.write(fd)
+
+def remove_file(fname, ignore_errors=True):
+    try:
+        os.remove(fname)
+    except OSError, e:
+        if not ignore_errors:
+            raise e
+
+def copy_files(realm_name, dir):
+    config_dir = dsinstance.config_dirname(dsinstance.realm_to_serverid(realm_name))
+
+    try:
+        shutil.copy("/var/kerberos/krb5kdc/ldappwd", dir + "/ldappwd") 
+        shutil.copy("/var/kerberos/krb5kdc/kpasswd.keytab", dir + "/kpasswd.keytab") 
+        shutil.copy("/usr/share/ipa/html/ca.crt", dir + "/ca.crt")
+        if ipautil.file_exists("/usr/share/ipa/html/preferences.html"):
+            shutil.copy("/usr/share/ipa/html/preferences.html", dir + "/preferences.html")
+            shutil.copy("/usr/share/ipa/html/configure.jar", dir + "/configure.jar")
+    except Exception, e:
+        print "error copying files: " + str(e)
+        sys.exit(1)
+
+def get_dirman_password():
+    return installutils.read_password("Directory Manager (existing master)", confirm=False, validate=False)
+
+def main():
+    options, args = parse_options()
+
+    replica_fqdn = args[0]
+
+    # Just initialize the environment. This is so the installer can have
+    # access to the plugin environment
+    api.bootstrap(in_server=True)
+    api.finalize()
+
+    if options.ip_address:
+        if not bindinstance.dns_container_exists(api.env.host, api.env.realm):
+            print "You can't add a DNS record because DNS is not set up."
+            sys.exit(1)
+
+    if not certs.ipa_self_signed() and not ipautil.file_exists("/var/lib/pki-ca/conf/CS.cfg") and not options.dirsrv_pin:
+        sys.exit("The replica must be created on the primary IPA server.\nIf you installed IPA with your own certificates using PKCS#12 files you must provide PKCS#12 files for any replicas you create as well.")
+
+    check_ipa_configuration(api.env.realm)
+
+    if api.env.host == replica_fqdn:
+        print "You can't create a replica on itself"
+        sys.exit(1)
+    ds_dir = dsinstance.config_dirname(dsinstance.realm_to_serverid(api.env.realm))
+    ds_user = get_ds_user(ds_dir)
+
+    # get the directory manager password
+    dirman_password = options.password
+    if not options.password:
+        try:
+            dirman_password = get_dirman_password()
+        except KeyboardInterrupt:
+            sys.exit(0)
+
+    # Try out the password
+    ldapuri = 'ldap://%s:389' % api.env.host
+    try:
+        conn = ldap2(shared_instance=False, ldap_uri=ldapuri)
+        conn.connect(bind_dn='cn=directory manager', bind_pw=dirman_password)
+        conn.disconnect()
+    except errors.ACIError:
+        sys.exit("\nThe password provided is incorrect for LDAP server %s" % api.env.host)
+    except errors.LDAPError:
+        sys.exit("\nUnable to connect to LDAP server %s" % api.env.host)
+
+    print "Preparing replica for %s from %s" % (replica_fqdn, api.env.host)
+
+    subject_base = get_subject_base(api.env.host, dirman_password, util.realm_to_suffix(api.env.realm))
+
+    top_dir = tempfile.mkdtemp("ipa")
+    dir = top_dir + "/realm_info"
+    os.mkdir(dir, 0700)
+
+    if options.dirsrv_pin:
+        passwd = options.dirsrv_pin
+    else:
+        passwd = ""
+
+    passwd_fname = dir + "/dirsrv_pin.txt"
+    fd = open(passwd_fname, "w")
+    fd.write("%s\n" % passwd)
+    fd.close()
+
+    if options.dirsrv_pkcs12:
+        print "Copying SSL certificate for the Directory Server from %s" % options.dirsrv_pkcs12
+        try:
+            shutil.copy(options.dirsrv_pkcs12, dir + "/dscert.p12")
+        except IOError, e:
+            print "Copy failed %s" %  e
+            sys.exit(1)
+    else:
+        try:
+            if not certs.ipa_self_signed():
+                # FIXME, need option for location of CA backup
+                if ipautil.file_exists(options.ca_file):
+                    shutil.copy(options.ca_file, dir + "/cacert.p12")
+                else:
+                    raise RuntimeError("Root CA PKCS#12 not found in %s" % options.ca_file)
+        except IOError, e:
+            print "Copy failed %s" %  e
+            sys.exit(1)
+        print "Creating SSL certificate for the Directory Server"
+        export_certdb(api.env.realm, ds_dir, dir, passwd_fname, "dscert", replica_fqdn, subject_base)
+
+    if options.http_pin:
+        passwd = options.http_pin
+    else:
+        passwd = ""
+
+    passwd_fname = dir + "/http_pin.txt"
+    fd = open(passwd_fname, "w")
+    fd.write("%s\n" % passwd)
+    fd.close()
+
+    if options.http_pkcs12:
+        print "Copying SSL certificate for the Web Server from %s" % options.http_pkcs12
+        try:
+            shutil.copy(options.http_pkcs12, dir + "/httpcert.p12")
+        except IOError, e:
+            print "Copy failed %s" %  e
+            sys.exit(1)
+    else:
+        print "Creating SSL certificate for the Web Server"
+        export_certdb(api.env.realm, ds_dir, dir, passwd_fname, "httpcert", replica_fqdn, subject_base)
+        print "Exporting RA certificate"
+        export_ra_pkcs12(dir, dirman_password)
+
+    print "Copying additional files"
+    copy_files(api.env.realm, dir)
+    print "Finalizing configuration"
+    save_config(dir, api.env.realm, api.env.host, ds_user, api.env.domain, replica_fqdn, subject_base)
+
+    replicafile = "/var/lib/ipa/replica-info-" + replica_fqdn
+    encfile = replicafile+".gpg"
+
+    print "Packaging replica information into %s" % encfile
+    ipautil.run(["/bin/tar", "cf", replicafile, "-C", top_dir, "realm_info"])
+    ipautil.encrypt_file(replicafile, encfile, dirman_password, top_dir);
+
+    remove_file(replicafile)
+    shutil.rmtree(dir)
+
+    if options.ip_address:
+        print "Adding DNS records for %s" % replica_fqdn
+        api.Backend.ldap2.connect(bind_dn="cn=Directory Manager", bind_pw=dirman_password)
+
+        domain = replica_fqdn.split(".")
+        name = domain.pop(0)
+        domain = ".".join(domain)
+
+        zone = add_zone(domain)
+        add_rr(zone, name, "A", options.ip_address)
+        add_reverze_zone(options.ip_address)
+        add_ptr_rr(options.ip_address, replica_fqdn)
+
+try:
+    if not os.geteuid()==0:
+        sys.exit("\nYou must be root to run this script.\n")
+
+    main()
+except SystemExit, e:
+    sys.exit(e)
+except Exception, e:
+    print "preparation of replica failed: %s" % str(e)
+    message = str(e)
+    for str in traceback.format_tb(sys.exc_info()[2]):
+        message = message + "\n" + str
+    logging.debug(message)
+    print message
+    sys.exit(1)
